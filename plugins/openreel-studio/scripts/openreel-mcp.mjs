@@ -14,6 +14,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 20 * 60 * 1000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 15 * 1000;
 const DEFAULT_NODE_WAIT_TIMEOUT_SECONDS = 20 * 60;
 const CONNECTION_CONFIG_VERSION = 1;
+const ASSET_LIBRARY_KINDS = new Set(["character", "scene", "storyboard"]);
 const CONNECTION_ENV_NAMES = [
   "OPENREEL_BASE_URL",
   "OPENREEL_USERNAME",
@@ -531,6 +532,52 @@ const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
   {
+    name: "openreel_list_assets",
+    title: "Query OpenReel Asset Library",
+    description:
+      "Query the selected project's reusable asset library by kind, category, text, or regular expression. Returned asset paths can be used in node references.",
+    inputSchema: objectSchema(
+      {
+        project_id: stringField("Optional project UUID; defaults to the selected project."),
+        kind: {
+          type: "string",
+          enum: ["character", "scene", "storyboard"],
+          description: "Optional asset kind: character, scene, or storyboard.",
+        },
+        category: stringField("Optional exact asset-library category."),
+        query: stringField("Optional plain-text search across asset metadata."),
+        regex: stringField("Optional regular-expression search across asset metadata."),
+        case_sensitive: booleanField("Use case-sensitive matching.", false),
+        offset: { type: "integer", minimum: 0, description: "Result offset; defaults to 0." },
+        limit: { type: "integer", minimum: 1, maximum: 100, description: "Maximum returned assets; defaults to 50." },
+      },
+      [],
+    ),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "openreel_upload_asset",
+    title: "Upload or Save an OpenReel Asset",
+    description:
+      "Save one local file or existing canvas node into the selected project's reusable asset library. Provide exactly one of file_path or node_id.",
+    inputSchema: objectSchema(
+      {
+        project_id: stringField("Optional project UUID; defaults to the selected project."),
+        file_path: stringField("Absolute local file path readable by the Codex host."),
+        node_id: stringField("Existing OpenReel canvas node id, including a visible id such as #3."),
+        kind: {
+          type: "string",
+          enum: ["character", "scene", "storyboard"],
+          description: "Asset kind: character, scene, or storyboard.",
+        },
+        category: stringField("Optional asset-library category; defaults to 未分类."),
+        name: stringField("Optional user-visible asset name; a local file defaults to its filename."),
+      },
+      ["kind"],
+    ),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  {
     name: "openreel_get_model_config",
     title: "Get Masked OpenReel Model Configuration",
     description: "Read OpenReel's parsed model/provider configuration together with masked secret metadata.",
@@ -749,6 +796,8 @@ const EXPOSED_TOOL_NAMES = new Set([
   "openreel_wait_for_node",
   "openreel_publish_generated_image",
   "openreel_upload_node_media",
+  "openreel_list_assets",
+  "openreel_upload_asset",
   "openreel_search_capabilities",
   "openreel_describe_capability",
   "openreel_execute_capability",
@@ -773,6 +822,8 @@ const PROJECT_SCOPED_TOOL_NAMES = new Set([
   "openreel_wait_for_node",
   "openreel_publish_generated_image",
   "openreel_upload_node_media",
+  "openreel_list_assets",
+  "openreel_upload_asset",
   "openreel_execute_capability",
   "openreel_execute_destructive_capability",
 ]);
@@ -1418,6 +1469,137 @@ async function uploadLocalNodeMedia(projectId, nodeId, filePath, { resolveNode =
   );
 }
 
+function compactAsset(item) {
+  const record = objectValue(item);
+  if (!record) return undefined;
+  return omitUndefined({
+    title: compactString(record.title, 300),
+    name: compactString(record.name, 300),
+    kind: record.kind,
+    category: compactString(record.category, 300),
+    path: compactString(record.path, 2000),
+    mime_type: record.mime_type,
+    size: record.size,
+    width: record.width,
+    height: record.height,
+    resolution: record.resolution,
+    prompt_snippet: compactString(record.prompt_snippet, 500),
+    modified_at: record.modified_at,
+    match: record.match,
+  });
+}
+
+async function queryAssetLibrary(args) {
+  const projectId = requireString(args.project_id, "project_id");
+  const kind = typeof args.kind === "string" && args.kind.trim() ? args.kind.trim() : undefined;
+  if (kind && !ASSET_LIBRARY_KINDS.has(kind)) {
+    throw new Error("kind must be character, scene, or storyboard.");
+  }
+  const result = await callOpenReelTool("assets.list_shared", omitUndefined({
+    project_id: projectId,
+    kind,
+    category: typeof args.category === "string" && args.category.trim() ? args.category.trim() : undefined,
+    query: typeof args.query === "string" ? args.query.trim() : undefined,
+    regex: typeof args.regex === "string" && args.regex.trim() ? args.regex.trim() : undefined,
+    case_sensitive: args.case_sensitive === true,
+  }));
+  if (result?.ok === false || result?.error) return { ok: false, error: result?.error || "Asset query failed." };
+  const items = Array.isArray(result?.items) ? result.items : [];
+  const offset = Math.trunc(boundedNumber(args.offset, 0, 0, Math.max(items.length, 0)));
+  const limit = Math.trunc(boundedNumber(args.limit, 50, 1, 100));
+  const page = items.slice(offset, offset + limit).map(compactAsset).filter(Boolean);
+  const nextOffset = offset + page.length < items.length ? offset + page.length : undefined;
+  return omitUndefined({
+    ok: true,
+    count: Number.isFinite(Number(result?.count)) ? Number(result.count) : items.length,
+    returned: page.length,
+    offset,
+    next_offset: nextOffset,
+    items: page,
+  });
+}
+
+async function saveAssetToLibrary(args) {
+  const projectId = requireString(args.project_id, "project_id");
+  const kind = requireString(args.kind, "kind");
+  if (!ASSET_LIBRARY_KINDS.has(kind)) {
+    throw new Error("kind must be character, scene, or storyboard.");
+  }
+  const filePath = typeof args.file_path === "string" && args.file_path.trim() ? args.file_path.trim() : null;
+  const nodeId = typeof args.node_id === "string" && args.node_id.trim() ? args.node_id.trim() : null;
+  if ((filePath ? 1 : 0) + (nodeId ? 1 : 0) !== 1) {
+    throw new Error("Provide exactly one of file_path or node_id.");
+  }
+
+  let source;
+  let stagedUpload;
+  let defaultName;
+  if (filePath) {
+    const local = await localMediaFile(filePath);
+    const form = new FormData();
+    form.append("file", await openAsBlob(local.filePath, { type: local.mimeType }), path.basename(local.filePath));
+    stagedUpload = await requestOpenReel(
+      `/api/uploads/${encodeSegment(projectId, "project_id")}`,
+      { method: "POST", body: form },
+    );
+    source = requireString(stagedUpload?.rel_path, "uploaded rel_path");
+    defaultName = path.parse(local.filePath).name;
+  } else {
+    source = `node:${requireString(nodeId, "node_id")}`;
+  }
+
+  const requestedName = typeof args.name === "string" && args.name.trim() ? args.name.trim() : defaultName;
+  const category = typeof args.category === "string" && args.category.trim() ? args.category.trim() : undefined;
+  let saved;
+  try {
+    saved = await callOpenReelTool("assets.save_to_shared", omitUndefined({
+      project_id: projectId,
+      kind,
+      category,
+      source,
+      name: requestedName,
+    }));
+  } catch (error) {
+    saved = { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (saved?.ok === false || saved?.error) {
+    return omitUndefined({
+      ok: false,
+      error: saved?.error || "Asset save failed.",
+      staged_upload: stagedUpload
+        ? {
+            rel_path: stagedUpload.rel_path,
+            filename: stagedUpload.filename,
+            size: stagedUpload.size,
+            mime_type: stagedUpload.mime_type,
+          }
+        : undefined,
+      hint: stagedUpload
+        ? "The project upload was preserved. Retry saving that rel_path to the asset library."
+        : "The source node was preserved. Retry saving the same node.",
+    });
+  }
+
+  const verified = await callOpenReelTool("assets.list_shared", {
+    project_id: projectId,
+    kind,
+    category: saved.category,
+  });
+  const persisted = Array.isArray(verified?.items)
+    ? verified.items.find((item) => item?.path === saved.path)
+    : undefined;
+  return {
+    ok: true,
+    source: filePath ? "local_file" : "canvas_node",
+    asset: compactAsset(persisted) || omitUndefined({
+      title: requestedName,
+      kind: saved.kind ?? kind,
+      category: saved.category,
+      path: saved.path,
+    }),
+  };
+}
+
 function publishedImageResult(result, transport) {
   return {
     ok: result?.ok !== false,
@@ -1957,10 +2139,20 @@ function mimeTypeFor(filePath) {
       ".webp": "image/webp",
       ".gif": "image/gif",
       ".bmp": "image/bmp",
+      ".svg": "image/svg+xml",
       ".mp4": "video/mp4",
       ".webm": "video/webm",
       ".mov": "video/quicktime",
       ".m4v": "video/x-m4v",
+      ".mp3": "audio/mpeg",
+      ".wav": "audio/wav",
+      ".m4a": "audio/mp4",
+      ".aac": "audio/aac",
+      ".ogg": "audio/ogg",
+      ".flac": "audio/flac",
+      ".txt": "text/plain",
+      ".md": "text/markdown",
+      ".json": "application/json",
     }[extension] ?? "application/octet-stream"
   );
 }
@@ -2563,6 +2755,14 @@ const HANDLERS = {
     return uploadLocalNodeMedia(projectId, args.node_id, args.file_path);
   },
 
+  async openreel_list_assets(args) {
+    return queryAssetLibrary(args);
+  },
+
+  async openreel_upload_asset(args) {
+    return saveAssetToLibrary(args);
+  },
+
   async openreel_get_model_config() {
     const response = await requestOpenReel("/api/tools/config/file?mask_secrets=true");
     return {
@@ -2612,7 +2812,7 @@ async function handleRequest(message) {
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        "Codex orchestrates OpenReel through the openreel_* tools. Start with connection verification and exact project selection, then read the minimum state required for the request. Use direct project, node, edge, contract, single-run, server-wait, publish, and upload tools for common work. Call openreel_create_nodes directly when media fields are known because it preflights internally; use openreel_describe_node_contract only for provider discovery or field repair. Use openreel_search_capabilities → openreel_describe_capability → the returned executor only for uncommon operations. For image creation, use Codex imagegen → openreel_publish_generated_image by default. Video uses the OpenReel create → run path and defaults to 720p; use any other resolution only when the user explicitly requests it. List each media source once in fields.references, and do not mirror it into reference_images or depends_on. Set generate_audio only when the selected protocol declares supports_native_audio=true; otherwise omit it. OpenReel and UMA own provider requests and upstream polling, while the bridge holds one event-driven server wait and returns a compact terminal summary. A non-terminal wait timeout means continue waiting on the same node, never rerun it implicitly. Obtain explicit authorization for destructive actions. OpenReel /api/chat remains the separate built-in-agent path.",
+        "Codex orchestrates OpenReel through the openreel_* tools. Start with connection verification and exact project selection, then read the minimum state required for the request. Use direct project, node, edge, contract, single-run, server-wait, publish, asset-library, and upload tools for common work. Call openreel_create_nodes directly when media fields are known because it preflights internally; use openreel_describe_node_contract only for provider discovery or field repair. Use openreel_search_capabilities → openreel_describe_capability → the returned executor only for uncommon operations. For image creation, use Codex imagegen → openreel_publish_generated_image by default. Video uses the OpenReel create → run path and defaults to 720p; use any other resolution only when the user explicitly requests it. List each media source once in fields.references, and do not mirror it into reference_images or depends_on. Set generate_audio only when the selected protocol declares supports_native_audio=true; otherwise omit it. OpenReel and UMA own provider requests and upstream polling, while the bridge holds one event-driven server wait and returns a compact terminal summary. A non-terminal wait timeout means continue waiting on the same node, never rerun it implicitly. Obtain explicit authorization for destructive actions. OpenReel /api/chat remains the separate built-in-agent path.",
     });
     return;
   }

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -16,10 +19,15 @@ async function startFakeOpenReel() {
   const projectCreateRequests = [];
   const projectActivationRequests = [];
   const contractRequests = [];
+  const assetUploadRequests = [];
   const server = http.createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
-    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : null;
+    const rawBody = Buffer.concat(chunks);
+    const contentType = String(request.headers["content-type"] || "");
+    const body = rawBody.length && contentType.startsWith("application/json")
+      ? JSON.parse(rawBody.toString("utf8"))
+      : null;
     response.setHeader("Content-Type", "application/json");
 
     if (request.url === "/api/health") {
@@ -74,8 +82,79 @@ async function startFakeOpenReel() {
       }));
       return;
     }
+    if (request.method === "POST" && request.url === "/api/uploads/project-1") {
+      assetUploadRequests.push({
+        url: request.url,
+        content_type: contentType,
+        body: rawBody.toString("utf8"),
+      });
+      response.end(JSON.stringify({
+        attachment_id: "asset-upload",
+        rel_path: "uploads/asset-upload-hero.png",
+        filename: "hero.png",
+        size: rawBody.length,
+        mime_type: "image/png",
+        kind: "image",
+      }));
+      return;
+    }
     if (request.url === "/api/tools/call") {
       toolCalls.push(body);
+      if (body.tool === "assets.save_to_shared") {
+        response.end(JSON.stringify({
+          tool: body.tool,
+          result: {
+            ok: true,
+            kind: body.args.kind,
+            category: body.args.category || "未分类",
+            path: `/workspace/assets/人物/${body.args.category || "未分类"}/${body.args.name || "hero"}.png`,
+          },
+        }));
+        return;
+      }
+      if (body.tool === "assets.list_shared") {
+        response.end(JSON.stringify({
+          tool: body.tool,
+          result: {
+            ok: true,
+            count: 3,
+            items: [
+              {
+                title: "Hero",
+                name: "hero.png",
+                kind: "character",
+                category: "主要角色",
+                path: "/workspace/assets/人物/主要角色/hero.png",
+                mime_type: "image/png",
+                size: 1024,
+                width: 1024,
+                height: 1024,
+                resolution: "1024x1024",
+                prompt_snippet: "hero prompt",
+              },
+              {
+                title: "Villain",
+                name: "villain.png",
+                kind: "character",
+                category: "主要角色",
+                path: "/workspace/assets/人物/主要角色/villain.png",
+                mime_type: "image/png",
+                size: 2048,
+              },
+              {
+                title: "Harbor",
+                name: "harbor.png",
+                kind: "scene",
+                category: "海边",
+                path: "/workspace/assets/场景/海边/harbor.png",
+                mime_type: "image/png",
+                size: 4096,
+              },
+            ],
+          },
+        }));
+        return;
+      }
       if (body.tool === "node.get") {
         response.end(JSON.stringify({
           tool: body.tool,
@@ -177,6 +256,7 @@ async function startFakeOpenReel() {
     projectCreateRequests,
     projectActivationRequests,
     contractRequests,
+    assetUploadRequests,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
@@ -285,6 +365,117 @@ test("project creation selects and activates the new project in the OpenReel UI"
   } finally {
     await bridge.close();
     await fake.close();
+  }
+});
+
+test("asset-library tools are exposed as direct project-scoped capabilities", async () => {
+  const fake = await startFakeOpenReel();
+  const bridge = startBridge(fake.baseUrl);
+  try {
+    await bridge.call("initialize", { protocolVersion: "2025-11-25", capabilities: {} });
+    const response = await bridge.call("tools/list");
+    const listAssets = response.result.tools.find((item) => item.name === "openreel_list_assets");
+    const uploadAsset = response.result.tools.find((item) => item.name === "openreel_upload_asset");
+
+    assert.ok(listAssets);
+    assert.ok(uploadAsset);
+    assert.equal(listAssets.annotations.readOnlyHint, true);
+    assert.equal(uploadAsset.annotations.readOnlyHint, false);
+    assert.deepEqual(
+      uploadAsset.inputSchema.properties.kind.enum,
+      ["character", "scene", "storyboard"],
+    );
+  } finally {
+    await bridge.close();
+    await fake.close();
+  }
+});
+
+test("asset-library queries forward filters and return compact pagination", async () => {
+  const fake = await startFakeOpenReel();
+  const bridge = startBridge(fake.baseUrl);
+  try {
+    await bridge.call("initialize", { protocolVersion: "2025-11-25", capabilities: {} });
+    const response = await bridge.call("tools/call", {
+      name: "openreel_list_assets",
+      arguments: {
+        project_id: "project-1",
+        kind: "character",
+        category: "主要角色",
+        query: "角色",
+        offset: 1,
+        limit: 1,
+      },
+    });
+    const result = response.result.structuredContent;
+
+    assert.equal(result.ok, true);
+    assert.equal(result.count, 3);
+    assert.equal(result.returned, 1);
+    assert.equal(result.offset, 1);
+    assert.equal(result.next_offset, 2);
+    assert.deepEqual(result.items, [{
+      title: "Villain",
+      name: "villain.png",
+      kind: "character",
+      category: "主要角色",
+      path: "/workspace/assets/人物/主要角色/villain.png",
+      mime_type: "image/png",
+      size: 2048,
+    }]);
+    const queryCall = fake.toolCalls.find((item) => item.tool === "assets.list_shared");
+    assert.deepEqual(queryCall.args, {
+      project_id: "project-1",
+      kind: "character",
+      category: "主要角色",
+      query: "角色",
+      case_sensitive: false,
+    });
+  } finally {
+    await bridge.close();
+    await fake.close();
+  }
+});
+
+test("a local file is uploaded once and persisted into the asset library", async () => {
+  const fake = await startFakeOpenReel();
+  const bridge = startBridge(fake.baseUrl);
+  const tempDir = await mkdtemp(path.join(tmpdir(), "openreel-asset-test-"));
+  const imagePath = path.join(tempDir, "hero.png");
+  await writeFile(imagePath, "fake-png-content");
+  try {
+    await bridge.call("initialize", { protocolVersion: "2025-11-25", capabilities: {} });
+    const response = await bridge.call("tools/call", {
+      name: "openreel_upload_asset",
+      arguments: {
+        project_id: "project-1",
+        file_path: imagePath,
+        kind: "character",
+        category: "主要角色",
+      },
+    });
+    const result = response.result.structuredContent;
+
+    assert.equal(response.result.isError, undefined);
+    assert.equal(result.ok, true);
+    assert.equal(result.source, "local_file");
+    assert.equal(result.asset.path, "/workspace/assets/人物/主要角色/hero.png");
+    assert.equal(fake.assetUploadRequests.length, 1);
+    assert.match(fake.assetUploadRequests[0].content_type, /^multipart\/form-data; boundary=/);
+    assert.match(fake.assetUploadRequests[0].body, /filename="hero.png"/);
+    assert.match(fake.assetUploadRequests[0].body, /fake-png-content/);
+    const saveCall = fake.toolCalls.find((item) => item.tool === "assets.save_to_shared");
+    assert.deepEqual(saveCall.args, {
+      project_id: "project-1",
+      kind: "character",
+      category: "主要角色",
+      source: "uploads/asset-upload-hero.png",
+      name: "hero",
+    });
+  } finally {
+    await bridge.close();
+    await fake.close();
+    await rm(tempDir, { recursive: true, force: true });
   }
 });
 

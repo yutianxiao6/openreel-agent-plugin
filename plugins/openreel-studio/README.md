@@ -75,7 +75,7 @@ node scripts/openreel-mcp.mjs --check
 1. `openreel_connection_info` 发现并验证 OpenReel。
 2. `openreel_list_projects` 确认当前目标，必要时使用 `openreel_select_project`。
 3. 图级任务读取一次 `openreel_get_canvas`；已知节点任务使用 `openreel_get_nodes` 精确读取。
-4. 项目、节点、依赖线和单节点运行使用直接工具。
+4. 项目、节点、依赖线、资产库查询/上传和单节点运行使用直接工具。
 5. 动态节点合同与复杂低频操作使用 `search → describe → execute`。
 6. 完整持久化结果或终态运行结果作为验证；后续步骤依赖新拓扑时再读取画布。
 
@@ -89,11 +89,27 @@ node scripts/openreel-mcp.mjs --check
 - 画布与节点读取，节点创建、更新、移动和授权删除。
 - 依赖线创建、更新和授权删除。
 - 单节点运行、服务端终态等待、已有节点媒体上传、Codex 图片发布。
+- 资产库按人物、场景、分镜、分类和关键词查询；本地文件或已有画布节点保存到资产库。
 - 延迟能力的搜索、描述、普通执行和授权破坏性执行。
 
 延迟目录提供 6 项复杂或低频能力：节点复制、媒体历史切换、混合画布 patch、批量运行、恢复画布快照、批量删除或恢复。搜索返回短摘要；描述返回精确 `input_schema`、安全类别、执行器名称和 `schema_ref`；执行阶段按 schema 校验参数。动态节点合同已通过 `openreel_describe_node_contract` 直接提供。
 
 混合画布 patch 支持通过 `client_ref` 和 `client:<ref>` 引用同一调用中新建的节点，并按顺序执行。
+
+## 资产库
+
+`openreel_list_assets` 查询当前选中项目使用的可复用资产库，支持 `kind`、
+`category`、普通文本或正则过滤，并以 `offset` / `limit` 分页返回。返回的资产
+`path` 可以直接写入节点的 `fields.references`。
+
+`openreel_upload_asset` 支持两种来源：
+
+- `file_path`：把 Codex 主机可读的本地文件上传到 OpenReel，再保存到资产库。
+- `node_id`：把已有画布节点的持久化产物保存到资产库。
+
+每次只传一种来源，并指定 `kind=character|scene|storyboard`；`category` 使用用户
+自己的分类语言，省略时进入“未分类”。本地上传失败时会保留已完成的项目上传信息，
+便于重试资产库保存而不重复传输文件。
 
 ## 图片生成路径
 
