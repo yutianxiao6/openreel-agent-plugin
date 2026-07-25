@@ -349,6 +349,7 @@ test("project creation selects and activates the new project in the OpenReel UI"
 
     assert.equal(result.id, "project-new");
     assert.equal(result._codex_selected, true);
+    assert.equal(result._agent_selected, true);
     assert.deepEqual(result.ui_activation, {
       requested: true,
       refresh_page: true,
@@ -385,6 +386,33 @@ test("asset-library tools are exposed as direct project-scoped capabilities", as
       uploadAsset.inputSchema.properties.kind.enum,
       ["character", "scene", "storyboard"],
     );
+  } finally {
+    await bridge.close();
+    await fake.close();
+  }
+});
+
+test("MCP guidance and host-image publication stay agent-neutral", async () => {
+  const fake = await startFakeOpenReel();
+  const bridge = startBridge(fake.baseUrl);
+  try {
+    const initialized = await bridge.call("initialize", {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name: "generic-agent", version: "1.0.0" },
+    });
+    assert.doesNotMatch(initialized.result.instructions, /Codex/i);
+
+    const response = await bridge.call("tools/list");
+    const publishImage = response.result.tools.find(
+      (item) => item.name === "openreel_publish_generated_image",
+    );
+    assert.ok(publishImage);
+    assert.doesNotMatch(
+      `${publishImage.title} ${publishImage.description}`,
+      /Codex/i,
+    );
+    assert.ok(publishImage.inputSchema.properties.generation_backend);
   } finally {
     await bridge.close();
     await fake.close();

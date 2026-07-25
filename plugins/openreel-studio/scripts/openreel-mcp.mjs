@@ -107,7 +107,7 @@ const TOOLS = [
   {
     name: "openreel_list_projects",
     title: "List OpenReel Projects",
-    description: "List OpenReel projects and mark the project selected for this Codex session.",
+    description: "List OpenReel projects and mark the project selected for this agent session.",
     inputSchema: objectSchema({
       compact: booleanField("Return compact project identity and selection fields.", true),
     }),
@@ -127,7 +127,7 @@ const TOOLS = [
   {
     name: "openreel_create_project",
     title: "Create OpenReel Project",
-    description: "Create a project, select it for this Codex session, and ask an already-open OpenReel page to switch to it and reload.",
+    description: "Create a project, select it for this agent session, and ask an already-open OpenReel page to switch to it and reload.",
     inputSchema: objectSchema(
       { title: stringField("Session name.") },
       ["title"],
@@ -139,7 +139,7 @@ const TOOLS = [
     title: "Get OpenReel Session",
     description: "Read the selected OpenReel session id and name.",
     inputSchema: objectSchema(
-      { project_id: stringField("Optional project UUID; defaults to the project selected for this Codex session.") },
+      { project_id: stringField("Optional project UUID; defaults to the project selected for this agent session.") },
       [],
     ),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -502,15 +502,16 @@ const TOOLS = [
   },
   {
     name: "openreel_publish_generated_image",
-    title: "Publish Codex-Generated Image to OpenReel",
+    title: "Publish an Agent-Generated Image to OpenReel",
     description:
-      "Create a completed OpenReel image node from one local image produced by Codex's built-in image generator. Use this after image_gen by default; a user-selected OpenReel provider uses the node contract, create, and run path.",
+      "Create a completed OpenReel image node from one local image produced by the host agent. When no host image generator is available, use the OpenReel node contract, create, and run path.",
     inputSchema: objectSchema(
       {
         project_id: stringField("Optional project UUID; defaults to the selected project."),
-        file_path: stringField("Absolute local path returned by Codex image generation."),
+        file_path: stringField("Absolute local path returned by the host agent's image generation tool."),
         title: stringField("User-visible image node title."),
         prompt: stringField("The final prompt used to generate the image."),
+        generation_backend: stringField("Optional host image backend identifier; defaults to agent_host."),
         position: positionSchema("Optional preferred canvas position; OpenReel chooses an open position by default."),
       },
       ["file_path", "title"],
@@ -525,7 +526,7 @@ const TOOLS = [
       {
         project_id: stringField("Optional project UUID; defaults to the selected project."),
         node_id: stringField("Existing image or video node id."),
-        file_path: stringField("Absolute local path readable by the Codex host."),
+        file_path: stringField("Absolute local path readable by the agent host."),
       },
       ["node_id", "file_path"],
     ),
@@ -563,7 +564,7 @@ const TOOLS = [
     inputSchema: objectSchema(
       {
         project_id: stringField("Optional project UUID; defaults to the selected project."),
-        file_path: stringField("Absolute local file path readable by the Codex host."),
+        file_path: stringField("Absolute local file path readable by the agent host."),
         node_id: stringField("Existing OpenReel canvas node id, including a visible id such as #3."),
         kind: {
           type: "string",
@@ -721,7 +722,7 @@ const TOOLS = [
       "Search the server-side canvas capability catalog by intent. Returns compact capability ids and summaries; the describe stage loads one selected parameter schema.",
     inputSchema: objectSchema(
       {
-        query: stringField("What Codex needs to do, for example create nodes, move layout, run media, or delete an edge."),
+        query: stringField("What the agent needs to do, for example create nodes, move layout, run media, or delete an edge."),
         limit: { type: "integer", minimum: 1, maximum: 10, description: "Maximum compact matches; defaults to 6." },
       },
       ["query"],
@@ -1142,6 +1143,19 @@ function connectionConfigPath() {
   if (explicit) return path.resolve(explicit);
   if (process.platform === "win32") {
     const appData = String(process.env.APPDATA ?? "").trim() || path.join(homedir(), "AppData", "Roaming");
+    return path.join(appData, "OpenReel", "agent-connection.json");
+  }
+  if (process.platform === "darwin") {
+    return path.join(homedir(), "Library", "Application Support", "OpenReel", "agent-connection.json");
+  }
+  const configHome = String(process.env.XDG_CONFIG_HOME ?? "").trim() || path.join(homedir(), ".config");
+  return path.join(configHome, "openreel-agent-plugin", "connection.json");
+}
+
+function legacyConnectionConfigPath() {
+  if (String(process.env.OPENREEL_CONFIG_PATH ?? "").trim()) return null;
+  if (process.platform === "win32") {
+    const appData = String(process.env.APPDATA ?? "").trim() || path.join(homedir(), "AppData", "Roaming");
     return path.join(appData, "OpenReel", "codex-connection.json");
   }
   if (process.platform === "darwin") {
@@ -1189,11 +1203,18 @@ function parseStoredConnectionConfig(value) {
 async function loadStoredConnectionConfig() {
   if (storedConnectionConfigLoaded) return storedConnectionConfig;
   storedConnectionConfigLoaded = true;
-  try {
-    const parsed = JSON.parse(await readFile(connectionConfigPath(), "utf8"));
-    storedConnectionConfig = parseStoredConnectionConfig(parsed);
-  } catch (error) {
-    if (error?.code !== "ENOENT") storedConnectionConfigError = error instanceof Error ? error.message : String(error);
+  const candidatePaths = [connectionConfigPath(), legacyConnectionConfigPath()].filter(Boolean);
+  for (const candidatePath of candidatePaths) {
+    try {
+      const parsed = JSON.parse(await readFile(candidatePath, "utf8"));
+      storedConnectionConfig = parseStoredConnectionConfig(parsed);
+      return storedConnectionConfig;
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        storedConnectionConfigError = error instanceof Error ? error.message : String(error);
+        break;
+      }
+    }
   }
   return storedConnectionConfig;
 }
@@ -1237,12 +1258,15 @@ async function saveConnectionConfig(profile, baseUrl) {
 
 async function forgetConnectionConfig() {
   const configPath = connectionConfigPath();
-  let removed = true;
-  try {
-    await unlink(configPath);
-  } catch (error) {
-    if (error?.code === "ENOENT") removed = false;
-    else throw error;
+  const candidatePaths = [configPath, legacyConnectionConfigPath()].filter(Boolean);
+  const removedPaths = [];
+  for (const candidatePath of candidatePaths) {
+    try {
+      await unlink(candidatePath);
+      removedPaths.push(candidatePath);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
   }
   cachedConnection = null;
   storedConnectionConfig = null;
@@ -1250,7 +1274,7 @@ async function forgetConnectionConfig() {
   storedConnectionConfigError = null;
   selectedProject = null;
   atomicImageImportSupported = null;
-  return { ok: true, removed, config_path: configPath };
+  return { ok: true, removed: removedPaths.length > 0, config_path: configPath, removed_paths: removedPaths };
 }
 
 async function resolveConnectionProfile() {
@@ -1410,7 +1434,7 @@ async function discoverConnection({ refresh = false } = {}) {
   throw new Error(
     "No running OpenReel Studio installation was found. Start the installed OpenReel desktop app, " +
       `or start the source API. Scanned localhost ports ${process.env.OPENREEL_DISCOVERY_PORTS || DEFAULT_PORT_SPEC}. ` +
-      "For Docker or a remote deployment, set OPENREEL_BASE_URL explicitly before starting Codex.",
+      "For Docker or a remote deployment, set OPENREEL_BASE_URL explicitly before starting the agent client.",
   );
 }
 
@@ -1600,10 +1624,10 @@ async function saveAssetToLibrary(args) {
   };
 }
 
-function publishedImageResult(result, transport) {
+function publishedImageResult(result, transport, generationBackend) {
   return {
     ok: result?.ok !== false,
-    generation_backend: "codex_builtin",
+    generation_backend: generationBackend,
     transport,
     node_id: result?.id ?? result?._canvas_id ?? result?._canvas_node_id,
     title: result?.title,
@@ -2186,6 +2210,7 @@ const HANDLERS = {
     }
     return projects.map((project) => ({
       ...sessionProject(project),
+      _agent_selected: project?.id === selectedProject?.id,
       _codex_selected: project?.id === selectedProject?.id,
     }));
   },
@@ -2203,6 +2228,7 @@ const HANDLERS = {
     return {
       id: activated.project.id,
       title: activated.project.title,
+      _agent_selected: true,
       _codex_selected: true,
       ui_activation: activated.ui_activation,
     };
@@ -2697,13 +2723,17 @@ const HANDLERS = {
     const projectId = requireString(args.project_id, "project_id");
     const title = requireString(args.title, "title");
     const prompt = typeof args.prompt === "string" ? args.prompt.trim() : "";
+    const generationBackend =
+      typeof args.generation_backend === "string" && args.generation_backend.trim()
+        ? args.generation_backend.trim().slice(0, 128)
+        : "agent_host";
     const local = await localMediaFile(args.file_path, "image");
 
     if (atomicImageImportSupported !== false) {
       const form = new FormData();
       form.append("file", await openAsBlob(local.filePath, { type: local.mimeType }), path.basename(local.filePath));
       form.append("title", title);
-      form.append("generation_backend", "codex_builtin");
+      form.append("generation_backend", generationBackend);
       form.append("creator", "agent");
       if (prompt) form.append("prompt", prompt);
       if (args.position) {
@@ -2716,7 +2746,7 @@ const HANDLERS = {
           { method: "POST", body: form },
         );
         atomicImageImportSupported = true;
-        return publishedImageResult(imported, "atomic_import");
+        return publishedImageResult(imported, "atomic_import", generationBackend);
       } catch (error) {
         if (!unsupportedAtomicImageImport(error)) throw error;
         atomicImageImportSupported = false;
@@ -2736,7 +2766,7 @@ const HANDLERS = {
     const nodeId = requireString(created?.id, "created node id");
     try {
       const uploaded = await uploadLocalNodeMedia(projectId, nodeId, local.filePath, { resolveNode: false });
-      return publishedImageResult(uploaded, "legacy_create_then_upload");
+      return publishedImageResult(uploaded, "legacy_create_then_upload", generationBackend);
     } catch (error) {
       return {
         ok: false,
@@ -2812,7 +2842,7 @@ async function handleRequest(message) {
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions:
-        "Codex orchestrates OpenReel through the openreel_* tools. Start with connection verification and exact project selection, then read the minimum state required for the request. Use direct project, node, edge, contract, single-run, server-wait, publish, asset-library, and upload tools for common work. Call openreel_create_nodes directly when media fields are known because it preflights internally; use openreel_describe_node_contract only for provider discovery or field repair. Use openreel_search_capabilities → openreel_describe_capability → the returned executor only for uncommon operations. For image creation, use Codex imagegen → openreel_publish_generated_image by default. Video uses the OpenReel create → run path and defaults to 720p; use any other resolution only when the user explicitly requests it. List each media source once in fields.references, and do not mirror it into reference_images or depends_on. Set generate_audio only when the selected protocol declares supports_native_audio=true; otherwise omit it. OpenReel and UMA own provider requests and upstream polling, while the bridge holds one event-driven server wait and returns a compact terminal summary. A non-terminal wait timeout means continue waiting on the same node, never rerun it implicitly. Obtain explicit authorization for destructive actions. OpenReel /api/chat remains the separate built-in-agent path.",
+        "Use the openreel_* tools to operate OpenReel from the current agent client. Start with connection verification and exact project selection, then read the minimum state required for the request. Use direct project, node, edge, contract, single-run, server-wait, publish, asset-library, and upload tools for common work. Call openreel_create_nodes directly when media fields are known because it preflights internally; use openreel_describe_node_contract only for provider discovery or field repair. Use openreel_search_capabilities → openreel_describe_capability → the returned executor only for uncommon operations. For image creation, publish a host-generated local image when the client has an image generator; otherwise use the OpenReel create → run path. Video also uses create → run and defaults to 720p; use any other resolution only when the user explicitly requests it. List each media source once in fields.references, and do not mirror it into reference_images or depends_on. Set generate_audio only when the selected protocol declares supports_native_audio=true; otherwise omit it. OpenReel and UMA own provider requests and upstream polling, while the bridge holds one event-driven server wait and returns a compact terminal summary. A non-terminal wait timeout means continue waiting on the same node, never rerun it implicitly. Obtain explicit authorization for destructive actions. OpenReel /api/chat remains the separate built-in-agent path.",
     });
     return;
   }

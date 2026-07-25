@@ -1,7 +1,7 @@
 {
-  "name": "openreel-codex",
+  "name": "openreel-agent",
   "interface": {
-    "displayName": "OpenReel Codex"
+    "displayName": "OpenReel Agent"
   },
   "plugins": [
     {
